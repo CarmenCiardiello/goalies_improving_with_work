@@ -18,6 +18,8 @@ library(jsonlite)
 library(tidymodels)
 library(xgboost)
 library(arrow)
+library(duckdb)
+library(DBI)
 library(cli)
 
 # ---------------------------------------------------------------------------
@@ -351,14 +353,30 @@ extract_shots_from_game <- function(game_id) {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Build the full shot data frame
+# 3. DuckDB connection (in-memory)
 # ---------------------------------------------------------------------------
 
-build_shot_dataframe <- function(game_ids) {
+init_duckdb <- function() {
+  con <- dbConnect(duckdb(), dbdir = ":memory:")
+  cli_alert_success("Initialized in-memory DuckDB database")
+  con
+}
+
+# ---------------------------------------------------------------------------
+# 3b. Build the full shot data frame and store in DuckDB
+# ---------------------------------------------------------------------------
+
+build_shot_dataframe <- function(game_ids, con) {
   cache_path <- file.path(OUTPUT_DIR, "shots_all.parquet")
   if (file.exists(cache_path)) {
-    cli_alert_success("Loading cached shot data from {cache_path}")
-    return(read_parquet(cache_path))
+    cli_alert_success("Loading cached shot data into DuckDB from {cache_path}")
+    dbExecute(con, sprintf(
+      "CREATE TABLE shots AS SELECT * FROM read_parquet('%s')", cache_path
+    ))
+    row_count <- dbGetQuery(con, "SELECT COUNT(*) AS n FROM shots")$n
+    game_count <- dbGetQuery(con, "SELECT COUNT(DISTINCT game_id) AS n FROM shots")$n
+    cli_alert_success("Shot data: {row_count} rows across {game_count} games (in DuckDB)")
+    return(invisible(NULL))
   }
 
   n_games     <- length(game_ids)
@@ -385,16 +403,24 @@ build_shot_dataframe <- function(game_ids) {
   }
 
   df <- bind_rows(all_shots)
+
+  # Write parquet cache then load into DuckDB directly from parquet
   write_parquet(df, cache_path)
-  cli_alert_success("Shot data: {nrow(df)} rows across {n_distinct(df$game_id)} games")
-  df
+  dbExecute(con, sprintf(
+    "CREATE TABLE shots AS SELECT * FROM read_parquet('%s')", cache_path
+  ))
+
+  row_count <- dbGetQuery(con, "SELECT COUNT(*) AS n FROM shots")$n
+  game_count <- dbGetQuery(con, "SELECT COUNT(DISTINCT game_id) AS n FROM shots")$n
+  cli_alert_success("Shot data: {row_count} rows across {game_count} games (in DuckDB)")
+  invisible(NULL)
 }
 
 # ---------------------------------------------------------------------------
 # 4. Train xG model via tidymodels
 # ---------------------------------------------------------------------------
 
-train_xg_model <- function(shots_df) {
+train_xg_model <- function(con) {
   model_path <- file.path(OUTPUT_DIR, "xg_workflow.rds")
 
   if (file.exists(model_path)) {
@@ -402,15 +428,21 @@ train_xg_model <- function(shots_df) {
     return(readRDS(model_path))
   }
 
-  cli_alert_info("Preparing data for xG model...")
+  cli_alert_info("Preparing data for xG model (querying DuckDB)...")
 
-  # Exclude empty-net shots from training
-  train_data <- shots_df |>
-    filter(empty_net == 0L) |>
+  # Pull non-empty-net shots from DuckDB with only the columns needed for training
+  train_data <- dbGetQuery(con, "
+    SELECT shot_distance, shot_angle, is_rebound, is_rush,
+           COALESCE(time_since_last_event, 999) AS time_since_last_event,
+           change_in_shot_angle, manpower_diff, empty_net, period,
+           shot_type, is_goal
+    FROM shots
+    WHERE empty_net = 0
+  ") |>
+    as_tibble() |>
     mutate(
       is_goal   = factor(is_goal, levels = c(1, 0), labels = c("goal", "no_goal")),
-      shot_type = factor(shot_type),
-      time_since_last_event = replace_na(time_since_last_event, 999)
+      shot_type = factor(shot_type)
     )
 
   # tidymodels split
@@ -471,14 +503,21 @@ train_xg_model <- function(shots_df) {
 # 5. Score all shots and aggregate to goalie-game level
 # ---------------------------------------------------------------------------
 
-score_shots <- function(shots_df, xg_fit) {
-  cli_alert_info("Scoring all shots with xG model...")
+score_shots <- function(con, xg_fit) {
+  cli_alert_info("Scoring all shots with xG model (from DuckDB)...")
 
-  scored <- shots_df |>
+  # Pull all shots from DuckDB for scoring
+  scored <- dbGetQuery(con, "
+    SELECT *,
+           COALESCE(time_since_last_event, 999) AS tse_filled
+    FROM shots
+  ") |>
+    as_tibble() |>
     mutate(
       shot_type = factor(shot_type),
-      time_since_last_event = replace_na(time_since_last_event, 999)
-    )
+      time_since_last_event = tse_filled
+    ) |>
+    select(-tse_filled)
 
   # Predict xG (probability of goal)
   preds <- predict(xg_fit, scored, type = "prob")
@@ -490,32 +529,35 @@ score_shots <- function(shots_df, xg_fit) {
       xG = if_else(empty_net == 1L, 1.0, xG)
     )
 
-  scored
+  # Write scored shots back into DuckDB as a new table
+  dbExecute(con, "DROP TABLE IF EXISTS scored_shots")
+  dbWriteTable(con, "scored_shots", scored)
+  cli_alert_success("Scored {nrow(scored)} shots -> DuckDB table 'scored_shots'")
+
+  invisible(NULL)
 }
 
-build_goalie_game_dataframe <- function(scored_df) {
-  cli_alert_info("Aggregating to goalie-game level...")
+build_goalie_game_dataframe <- function(con) {
+  cli_alert_info("Aggregating to goalie-game level (SQL in DuckDB)...")
 
-  goalie_games <- scored_df |>
-    filter(!is.na(goalie_id), goalie_name != "Empty Net") |>
-    group_by(game_id, game_date, goalie_id, goalie_name, goalie_team) |>
-    summarise(
-      shots_against  = n(),
-      goals_against  = sum(is_goal),
-      xG_against     = sum(xG),
-      opposing_team  = first(shooting_team),
-      .groups = "drop"
-    ) |>
-    mutate(
-      GSAx      = xG_against - goals_against,
-      game_date = as.Date(game_date)
-    ) |>
-    select(
-      game_date, goalie_name, goalie_team, opposing_team,
-      shots_against, goals_against, xG_against, GSAx,
-      game_id, goalie_id
-    ) |>
-    arrange(game_date, goalie_name)
+  goalie_games <- dbGetQuery(con, "
+    SELECT
+      CAST(game_date AS DATE) AS game_date,
+      goalie_name,
+      goalie_team,
+      FIRST(shooting_team) AS opposing_team,
+      COUNT(*) AS shots_against,
+      SUM(is_goal) AS goals_against,
+      SUM(xG) AS xG_against,
+      SUM(xG) - SUM(is_goal) AS GSAx,
+      game_id,
+      goalie_id
+    FROM scored_shots
+    WHERE goalie_id IS NOT NULL
+      AND goalie_name != 'Empty Net'
+    GROUP BY game_id, game_date, goalie_id, goalie_name, goalie_team
+    ORDER BY game_date, goalie_name
+  ") |> as_tibble()
 
   goalie_games
 }
@@ -528,27 +570,39 @@ main <- function() {
   cli_h1("Goalie Game-Level xG & GSAx Builder")
   cli_alert_info("Seasons: {paste(SEASONS, collapse = ', ')}")
 
+  # Initialize in-memory DuckDB
+  con <- init_duckdb()
+  on.exit(dbDisconnect(con, shutdown = TRUE), add = TRUE)
+
   # Step 1: Collect game IDs
   game_ids <- collect_all_game_ids()
 
-  # Step 2: Build shot-level data frame from play-by-play
-  shots_df <- build_shot_dataframe(game_ids)
-  cli_h2("Shot data summary")
-  cli_alert_info("Rows: {nrow(shots_df)}")
-  cli_alert_info("Games: {n_distinct(shots_df$game_id)}")
-  cli_alert_info("Goals: {sum(shots_df$is_goal)}")
-  cli_alert_info("Goal rate: {round(mean(shots_df$is_goal) * 100, 2)}%")
+  # Step 2: Build shot-level data and load into DuckDB
+  build_shot_dataframe(game_ids, con)
 
-  # Step 3: Train xG model via tidymodels
-  xg_fit <- train_xg_model(shots_df)
+  cli_h2("Shot data summary (from DuckDB)")
+  summary <- dbGetQuery(con, "
+    SELECT COUNT(*) AS rows,
+           COUNT(DISTINCT game_id) AS games,
+           SUM(is_goal) AS goals,
+           ROUND(AVG(is_goal) * 100, 2) AS goal_rate
+    FROM shots
+  ")
+  cli_alert_info("Rows: {summary$rows}")
+  cli_alert_info("Games: {summary$games}")
+  cli_alert_info("Goals: {summary$goals}")
+  cli_alert_info("Goal rate: {summary$goal_rate}%")
 
-  # Step 4: Score all shots
-  scored_df <- score_shots(shots_df, xg_fit)
+  # Step 3: Train xG model via tidymodels (pulls from DuckDB)
+  xg_fit <- train_xg_model(con)
 
-  # Step 5: Aggregate to goalie-game level
-  goalie_games <- build_goalie_game_dataframe(scored_df)
+  # Step 4: Score all shots (reads from DuckDB, writes scored_shots back)
+  score_shots(con, xg_fit)
 
-  # Save outputs
+  # Step 5: Aggregate to goalie-game level via SQL in DuckDB
+  goalie_games <- build_goalie_game_dataframe(con)
+
+  # Save outputs via DuckDB COPY for efficiency
   csv_path     <- file.path(OUTPUT_DIR, "goalie_game_stats.csv")
   parquet_path <- file.path(OUTPUT_DIR, "goalie_game_stats.parquet")
 
