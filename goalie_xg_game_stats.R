@@ -430,15 +430,21 @@ train_xg_model <- function(con) {
 
   cli_alert_info("Preparing data for xG model (querying DuckDB)...")
 
-  # Pull non-empty-net shots from DuckDB with only the columns needed for training
-  train_data <- dbGetQuery(con, "
+  # Save training data as a persistent DuckDB table for reuse
+  dbExecute(con, "DROP TABLE IF EXISTS training_shots")
+  dbExecute(con, "
+    CREATE TABLE training_shots AS
     SELECT shot_distance, shot_angle, is_rebound, is_rush,
            COALESCE(time_since_last_event, 999) AS time_since_last_event,
            change_in_shot_angle, manpower_diff, empty_net, period,
            shot_type, is_goal
     FROM shots
     WHERE empty_net = 0
-  ") |>
+  ")
+  n_train <- dbGetQuery(con, "SELECT COUNT(*) AS n FROM training_shots")$n
+  cli_alert_success("Saved {n_train} training rows to DuckDB table 'training_shots'")
+
+  train_data <- dbGetQuery(con, "SELECT * FROM training_shots") |>
     as_tibble() |>
     mutate(
       is_goal   = factor(is_goal, levels = c(1, 0), labels = c("goal", "no_goal")),
@@ -480,7 +486,16 @@ train_xg_model <- function(con) {
     add_model(xg_spec)
 
   cli_alert_info("Training xG model...")
-  xg_fit <- xg_wf |> fit(data = train_set)
+  xg_fit <- tryCatch(
+    xg_wf |> fit(data = train_set),
+    error = function(e) {
+      cli_alert_danger("Model training failed: {e$message}")
+      cli_alert_warning("Play-by-play data is preserved in DuckDB tables 'shots' and 'training_shots'")
+      return(NULL)
+    }
+  )
+
+  if (is.null(xg_fit)) return(NULL)
 
   # Evaluate on test set
   test_preds <- predict(xg_fit, test_set, type = "prob") |>
@@ -520,7 +535,16 @@ score_shots <- function(con, xg_fit) {
     select(-tse_filled)
 
   # Predict xG (probability of goal)
-  preds <- predict(xg_fit, scored, type = "prob")
+  preds <- tryCatch(
+    predict(xg_fit, scored, type = "prob"),
+    error = function(e) {
+      cli_alert_danger("Scoring failed: {e$message}")
+      cli_alert_warning("Play-by-play data is preserved in DuckDB tables 'shots' and 'training_shots'")
+      return(NULL)
+    }
+  )
+
+  if (is.null(preds)) return(invisible(FALSE))
 
   scored <- scored |>
     mutate(
@@ -534,7 +558,7 @@ score_shots <- function(con, xg_fit) {
   dbWriteTable(con, "scored_shots", scored)
   cli_alert_success("Scored {nrow(scored)} shots -> DuckDB table 'scored_shots'")
 
-  invisible(NULL)
+  invisible(TRUE)
 }
 
 build_goalie_game_dataframe <- function(con) {
@@ -596,8 +620,18 @@ main <- function() {
   # Step 3: Train xG model via tidymodels (pulls from DuckDB)
   xg_fit <- train_xg_model(con)
 
+  if (is.null(xg_fit)) {
+    cli_alert_danger("Exiting: model training failed. Play-by-play data remains in DuckDB.")
+    return(invisible(NULL))
+  }
+
   # Step 4: Score all shots (reads from DuckDB, writes scored_shots back)
-  score_shots(con, xg_fit)
+  score_ok <- score_shots(con, xg_fit)
+
+  if (identical(score_ok, FALSE)) {
+    cli_alert_danger("Exiting: scoring failed. Play-by-play data remains in DuckDB.")
+    return(invisible(NULL))
+  }
 
   # Step 5: Aggregate to goalie-game level via SQL in DuckDB
   goalie_games <- build_goalie_game_dataframe(con)
